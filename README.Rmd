@@ -1,0 +1,494 @@
+---
+title: "Korea Social Contacts"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: html
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+Load packages
+
+```{r}
+library(data.table)
+library(dplyr)
+library(sf)
+library(DT)
+library(ggplot2)
+```
+
+Function to label region names in English
+
+```{r, warning=FALSE, message=FALSE}
+kor <- st_read("data/gadm41_KOR_1.shp")
+# kor$NAME_1
+# 1	서울특별시
+# 2	부산광역시
+# 3	대구광역시
+# 4	인천광역시
+# 5	광주광역시
+# 6	대전광역시
+# 7	울산광역시
+# 8	세종특별자치시
+# 9	경기도
+# 10	강원도
+# 11	충청북도
+# 12	충청남도
+# 13	전라북도
+# 14	전라남도
+# 15	경상북도
+# 16	경상남도
+# 17	제주특별자치도
+kor_regions <- c("Seoul",
+                 "Busan","Daegu","Incheon","Gwangju","Daejeon","Ulsan",
+                 "Sejong",
+                 "Gyeonggi-do","Gangwon-do",
+                 "Chungcheongbuk-do","Chungcheongnam-do",
+                 "Jeollabuk-do","Jeollanam-do",
+                 "Gyeongsangbuk-do","Gyeongsangnam-do",
+                 "Jeju")
+
+get_region <- function(i, regions){
+  return(regions[i])
+}
+```
+
+### Data 
+
+#### Respondents
+
+##### Check #1: File for the survey results
+```{r}
+res <- fread("data/df_res_cleansing_ver_3.csv")
+unique(res$SQ3)
+res$age <- as.integer(res$SQ1)
+res$gender <- ifelse(res$SQ2 == 1, "M", "F")
+res$region <- get_region(res$SQ3, region=kor_regions)
+res$hhsize <- as.integer(res$DQ2) # household size
+res$id <- res$ID_ori
+```
+
+#### Contacts
+
+##### Check #2: File for the contacts
+```{r}
+cont <- fread("data/df_con_cleansing_ver_3.csv")
+# datatable(cont) # interactive table exploration
+unique(cont$접촉날짜)
+cont$date <- ifelse(cont$접촉날짜 %in% c("1206","1207","1208","1209","1210","1211","1212"),
+                   paste0("2023",cont$접촉날짜), paste0("20240",cont$접촉날짜))
+cont$date <- as.Date(cont$date, format="%Y%m%d")
+cont$dayofweek <- weekdays(cont$date)
+cont$dayofweek <- factor(cont$dayofweek, levels=c("Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"))
+cont$id <- cont$ID_ori
+cont$duration <- as.integer(cont$Q8) # timehousehold size
+
+cont_1st <- cont[cont$date < as.Date("2024-01-01")] # first survey
+cont_2nd <- setdiff(cont, cont_1st) #2nd survey
+
+sprintf("Total respondents: %d (1st) and %d (2nd)",
+        length(unique(cont_1st$ID)), length(unique(cont_2nd$ID)))
+```
+
+##### Check #3: Number of contacts
+```{r}
+cont_1st |> 
+  dplyr::group_by(id, date, dayofweek) |> 
+  dplyr::summarize(contacts = max(접촉순서),
+                   mean_duration = mean(duration)) -> cont_1st_n 
+```
+
+Combine the participants and contacts data
+
+```{r}
+dat <- left_join(res, cont_1st_n, by="id")
+```
+
+Age group classification
+
+##### Check #4: Age classification: 0-9, 10-19, ... 
+```{r}
+age_grp_label <- c("0-9","10-19","20-29","30-39","40-49","50-59","60-69","70+")
+sum(is.na(dat$age))
+dat$age_grp <- ifelse(dat$age < 70, age_grp_label[floor(dat$age/10) + 1], 
+                      age_grp_label[8])
+dat$age_grp <- factor(dat$age_grp, levels=c(age_grp_label))
+table(dat$age_grp)
+```
+
+##### Check #4: Age classification: 0-4, 5-9, 10-14, 15-19, 20-29, 30-39, ..., 70+ 
+```{r}
+age_grp_label <- c("0-4","5-9","10-14","15-19","20-29",
+                   "30-39","40-49","50-59","60-69","70+")
+
+dat$age_grp <- ifelse(is.na(dat$age), "Missing", 
+                      ifelse(dat$age < 20,
+                             age_grp_label[floor(dat$age/5) + 1], 
+                             ifelse(dat$age < 80,
+                                    age_grp_label[floor(dat$age/10) + 3],
+                                    age_grp_label[10])))
+dat$age_grp <- factor(dat$age_grp, levels=c(age_grp_label))
+table(dat$age_grp)
+```
+
+Household size
+
+##### Check #5: Household size classification: 1, 2, .., 5+ 
+```{r}
+unique(dat$hhsize)
+table(dat$hhsize)
+sum(is.na(dat$hhsize))
+dat$hhsize_grp <- ifelse(dat$hhsize >= 5, "5+", as.character(dat$hhsize))
+dat$hhsize_grp <- factor(dat$hhsize_grp, levels=c(as.character(paste0(1:4)),"5+"))
+table(dat$hhsize_grp)
+```
+
+### Descriptive statistics 
+
+
+Contacts
+
+```{r}
+summary(dat$contacts)
+table(dat$contacts)
+```
+
+Number of contacts by the day of the week
+
+```{r}
+library(ggplot2)
+dat |> 
+  ggplot()+
+  geom_histogram(aes(x=contacts))+
+  facet_wrap(~dayofweek)+
+  theme_bw()
+
+dat |> 
+  ggplot()+
+  geom_violin(aes(x=dayofweek, y=contacts))
+
+dat |> 
+  dplyr::group_by(dayofweek) |> 
+  dplyr::summarize(mean_contacts = mean(contacts),
+                   se_contacts = sd(contacts)/sqrt(n()),
+                   lb_contacts = mean_contacts - 1.96 * se_contacts,
+                   ub_contacts = mean_contacts + 1.96 * se_contacts)
+```
+
+Number of contacts and contact duration by age group
+
+```{r}
+table(dat$age_grp)
+
+dat |> 
+  ggplot()+
+  geom_histogram(aes(x=contacts))+
+  facet_wrap(~age_grp)+
+  theme_bw()
+
+dat |> 
+  ggplot()+
+  geom_violin(aes(x=age_grp, y=contacts))
+
+dat |> 
+  dplyr::group_by(age_grp) |> 
+  dplyr::summarize(mean_contacts = mean(contacts),
+                   se_contacts = sd(contacts)/sqrt(n()),
+                   lb_contacts = mean_contacts - 1.96 * se_contacts,
+                   ub_contacts = mean_contacts + 1.96 * se_contacts)
+
+# duration is a category though.
+dat |> 
+  dplyr::group_by(age_grp) |> 
+  dplyr::summarize(mean_duration_ = mean(mean_duration),
+                   se_duration = sd(mean_duration)/sqrt(n()),
+                   lb_duration = mean_duration_ - 1.96 * se_duration,
+                   ub_duration = mean_duration_ + 1.96 * se_duration)
+
+```
+
+Mean number of contact by household size
+
+```{r}
+table(dat$hhsize_grp)
+
+dat |> 
+  dplyr::group_by(hhsize_grp) |> 
+  dplyr::summarize(mean_contacts = mean(contacts),
+                   se_contacts = sd(contacts)/sqrt(n()),
+                   lb_contacts = mean_contacts - 1.96 * se_contacts,
+                   ub_contacts = mean_contacts + 1.96 * se_contacts)
+```
+
+Mean number of contact by region
+
+```{r}
+table(dat$hhsize_grp)
+
+dat |> 
+  dplyr::group_by(region) |> 
+  dplyr::summarize(mean_contacts = mean(contacts),
+                   se_contacts = sd(contacts)/sqrt(n()),
+                   lb_contacts = mean_contacts - 1.96 * se_contacts,
+                   ub_contacts = mean_contacts + 1.96 * se_contacts)
+```
+
+
+Bivariate relationship
+
+```{r}
+library(Hmisc)
+vars_of_interest <- c("contacts", "age_grp", "gender", "dayofweek", "hhsize_grp")
+d <- dat[,..vars_of_interest]
+GGally::ggpairs(d)
+```
+
+Correlation
+```{r}
+# glimpse(dat)
+# voi <- c("age", "hhsize", "contacts")
+# Hmisc::rcorr(as.matrix(dat[,..voi]))
+# cor.test(dat[,..voi])
+library("ggpubr")
+ggscatter(dat, x = "age", y = "contacts", 
+          add = "reg.line", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Age", ylab = "Number of contacts")
+
+ggscatter(dat, x = "hhsize", y = "contacts", 
+          add = "reg.line", conf.int = TRUE, 
+          cor.coef = TRUE, cor.method = "pearson",
+          xlab = "Household size", ylab = "Number of contacts")
+
+# ggscatter(dat, x = "dayofweek", y = "contacts", 
+#           add = "reg.line", conf.int = TRUE, 
+#           cor.coef = TRUE, cor.method = "pearson",
+#           xlab = "Day of week", ylab = "Number of contacts")
+```
+
+
+### Regresssion analysis
+
+Label variables as factors
+```{r}
+dat$dayofweek <- factor(dat$dayofweek, levels=c("Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"))
+dat$age_grp <- factor(dat$age_grp, levels=c(age_grp_label))
+dat$hhsize_grp <- factor(dat$hhsize_grp, levels=c(as.character(paste0(1:4)),"5+"))
+dat$hhsize_grp <- relevel(dat$hhsize_grp, ref="1")
+dat$gender <- factor(dat$gender, levels=c("F","M"))
+dat$region <- factor(dat$region, levels=kor_regions)
+```
+
+Check completeness of the data
+
+```{r}
+# model_vars <- c("contacts", "age_grp", "gender", "dayofweek", 
+               # "hhsize_grp", "region")
+# dat <- dat[,..model_vars]
+all.equal(dat, dat[!is.na(contacts),]) # no NA's
+```
+
+### Regression
+
+Negative Binomial Regression 
+
+```{r}
+library(MASS)
+summary(m1 <- glm.nb(contacts ~ age_grp + gender + dayofweek + hhsize_grp                      + region, data = dat))
+
+knitr::kable(exp(m1$coefficients))
+```
+
+Poisson Regression
+
+```{r}
+library(MASS)
+summary(m2 <- glm(contacts ~ age_grp + gender + dayofweek + hhsize_grp + region,
+                  family="poisson", data = dat))
+# exp(m2$coefficients)
+df <- data.frame(Parameters=names(coef(m1)), NegBin=exp(as.numeric(coef(m1))),
+                 Poisson=exp(as.numeric(coef(m2))))
+knitr::kable(df)
+```
+
+Model comparison
+```{r}
+AIC(m1,m2)
+```
+
+
+```{r}
+summary(dat$contacts)
+table(dat$contacts)
+```
+
+### Weighting
+
+```{r}
+dat$age_grp_wt_row <- as.integer(ifelse(dat$age < 70, (floor(dat$age/10) + 1)*3, 8*3))
+table(dat$age_grp)
+table(dat$age_grp_wt_row)
+
+dat$hhsize_grp_wt_col <- as.integer(ifelse(dat$hhsize >= 5, 6, dat$hhsize + 1))
+table(dat$hhsize_grp)
+table(dat$hhsize_grp_wt_col)
+
+wt_data <- as.data.frame(fread("data/ratio_5plus.csv"))
+dat$wt <- sapply(1:nrow(dat), 
+                 function(i) as.numeric(wt_data[dat$age_grp_wt_row[i], dat$hhsize_grp_wt_col[i]]))
+
+```
+
+Negative Binomial Regression with weight  
+
+```{r}
+summary(m3 <- glm.nb(contacts ~ age_grp + gender + dayofweek + hhsize_grp + region,
+                     data = dat, weights = wt))
+# exp(m1$coefficients)
+df <- data.frame(Parameters=names(coef(m1)), NegBin=exp(as.numeric(coef(m1))),
+                 NegBin_Weight=exp(as.numeric(coef(m3))))
+knitr::kable(df)
+```
+
+```{r}
+summary(m4 <- glm.nb(contacts ~ age_grp + gender + dayofweek + hhsize_grp,
+                     data = dat, weights = wt))
+# exp(m1$coefficients)
+# df <- data.frame(Parameters=names(coef(m1)), NegBin=exp(as.numeric(coef(m1))),
+#                  NegBin_Weight=exp(as.numeric(coef(m3))))
+# knitr::kable(df)
+```
+
+Create table
+```{r}
+## Estimates
+xhat <- exp(summary(m4)$coefficients[,1])
+lb <- exp(summary(m4)$coefficients[,1]) - 
+  qnorm(0.975) * summary(m4)$coefficients[,2] 
+ub <- exp(summary(m4)$coefficients[,1]) + 
+  qnorm(0.975) * summary(m4)$coefficients[,2]
+
+est_ <- sprintf("%.2f (%.2f - %.2f)", xhat, lb, ub)
+# include reference values
+est <- c(est_[1], "1.00", est_[2:10], "1.00", est_[11], "1.00", est_[12:17],
+"1.00",est_[18:21])
+
+## Number of participants
+dat |> 
+  dplyr::group_by(age_grp) |>
+  dplyr::summarize(n = n(),
+                   mean_contacts = mean(contacts),
+                   sd_contacts = sd(contacts))  -> age_counts
+
+dat |> 
+  dplyr::group_by(gender) |>
+  dplyr::summarize(n = n(),
+                   mean_contacts = mean(contacts),
+                   sd_contacts = sd(contacts))  -> sex_counts
+
+dat |> 
+  dplyr::group_by(dayofweek) |>
+  dplyr::summarize(n = n(),
+                   mean_contacts = mean(contacts),
+                   sd_contacts = sd(contacts))  -> dayofweek_counts
+
+dat |> 
+  dplyr::group_by(hhsize_grp) |>
+  dplyr::summarize(n = n(),
+                   mean_contacts = mean(contacts),
+                   sd_contacts = sd(contacts))  -> household_counts
+
+numpart <- c(age_counts$n, sex_counts$n, dayofweek_counts$n, household_counts$n)
+mean_contacts <- c(age_counts$mean_contacts, sex_counts$mean_contacts, dayofweek_counts$mean_contacts, household_counts$mean_contacts)
+sd_contacts <- c(age_counts$sd_contacts, sex_counts$sd_contacts, dayofweek_counts$sd_contacts, household_counts$sd_contacts)
+contacts <- sprintf("%.2f (%.2f)", mean_contacts, sd_contacts)
+
+covars <- c("0-4", "5-9", "10-14", "15-19", "20-29","30-39", "40-49",
+               "50-59", "60-69", "70+",
+               "Female", "Male",
+               "Sunday","Monday","Tuesday","Wednesday","Thursday","Friday",
+               "Saturday", 
+               "1", "2", "3", "4", "5+")
+
+df <- data.frame(category=c(rep("Age of participants",10), 
+                          rep("Sex of participant",2),
+                          rep("Day of the week",7), rep("Household size",5)),
+                 covariate = covars, 
+                 num = numpart,
+                 marginals = contacts,
+                 estimates = est[2:25])
+
+names(df) <- c("Category","Covariate", "Number of participants", 
+               "Marginal mean reported contacts (standard deviation)",
+               "Estimates")
+
+knitr::kable(df)
+m4$theta
+m4$SE.theta
+est <- m3$theta
+lb <- m4$theta - qnorm(0.975)*m4$SE.theta 
+ub <- m4$theta + qnorm(0.975)*m4$SE.theta 
+sprintf("Dispersion parameter, theta = %.2f (%.2f - %.2f)", est, lb, ub)
+sprintf("alpha = %.2f (%.2f - %.2f)", 1/est, 1/ub, 1/lb)
+```
+
+In the negative binomial regression, the variance is given as $\mu+\frac{\mu^2}{\theta}$. Most other software, however, use the direct parameterization $\mu+\alpha\mu^2$. So did the POLYMOD paper, in which  $\alpha=0.36~(95\text{%}~\text{CI}:0.34-0.37)$
+ 
+Household size distribution from the census
+```{r, eval=F, include=F}
+library(readxl)
+hhsize <- read_xlsx("data/2023년 6월 주민등록_세대원수별_가구수.xlsx")
+nms <- hhsize[2,]
+hhsize <- hhsize[3:nrow(hhsize),]
+names(hhsize) <- as.character(nms)
+for (i in 3:ncol(hhsize)) {
+  hhsize[,i] <- as.integer(hhsize[,i,drop=TRUE])
+}
+hhsize$region <- c("Korea", kor_regions)
+korea_hhsize_prop <- unlist(hhsize[1, 4:13]) / unlist(hhsize[1, 3])
+sum(korea_hhsize_prop)
+
+dat |> 
+  dplyr::group_by(hhsize_grp) |> 
+  dplyr::summarize(num_hh = n()) -> dat_hhsize
+
+dat_hhsize$prop <- dat_hhsize$num_hh / sum(dat_hhsize$num_hh)
+
+df <- data.frame(hhsize_grp = c(as.character(paste0(1:9)),"10+"), 
+                 prop_census = korea_hhsize_prop)
+dat_hhsize <- left_join(df, dat_hhsize, by="hhsize_grp")
+dat_hhsize$num_hh <- ifelse(is.na(dat_hhsize$num_hh), 0, dat_hhsize$num_hh)
+dat_hhsize$prop <- ifelse(is.na(dat_hhsize$prop), 0, dat_hhsize$prop)
+
+dat_hhsize$wt <- dat_hhsize$prop_census / dat_hhsize$prop
+dat_hhsize
+```
+
+Age group distribution from the census
+```{r, eval=FALSE, include=FALSE}
+agedist <- read_xlsx("data/2023년_6월_주민등록_거주자_인구_ver_2.xlsx")
+ad <- agedist[4:nrow(agedist), 2:12]
+pop <- sapply(2:11, function(x) as.numeric(gsub(",", "", ad[,x,drop=T])))
+ad2 <- cbind(ad[,1], pop)
+names(ad2) <- names(ad)
+ad3 <- ad2[,2:11]/ad2[,3] # proportion of each age group
+ad3$sum <- rowSums(ad3[,3:10])
+
+ad4 <- cbind(data.frame(region=c("Korea", kor_regions), ad3))
+names(ad4) <- c("Region", "residents", "Census_pop", age_grp_label, "Sum_prop")
+
+# sample age dist
+dat |> 
+  dplyr::group_by(age_grp) |> 
+  dplyr::summarize(pop = n()) -> dat_agedist
+
+dat_agedist$prop <- dat_agedist$pop / sum(dat_agedist$pop)
+dat_agedist$prop_census <- unlist(ad4[1, age_grp_label])
+dat_agedist$wt <-  dat_agedist$prop_census / dat_agedist$prop
+dat_agedist
+```
+

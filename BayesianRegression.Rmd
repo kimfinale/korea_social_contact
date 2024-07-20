@@ -1,0 +1,1033 @@
+---
+title: "Korea Social Contacts: Linear Regression"
+output:
+  html_document:
+    df_print: paged
+editor_options:
+  chunk_output_type: html
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+## Packages
+```{r, echo=F}
+library(data.table)
+library(MASS)
+library(lme4)
+library(tidyverse)
+source("utils.R")
+```
+## Regresssion analysis
+
+### Variable selection
+
+![DAG](data/dag.png)
+
+### Prior knowledge
+
+- [A prior study](https://journals.plos.org/plosmedicine/article?id=10.1371/journal.pmed.0050074) and other numerous studies show that contacts differ by age.
+ 
+- A significant fraction of contacts occur with household members and as such the household size is important. 
+ 
+- Occupation will also play an important role in determining the number of contacts - consider a person working at a department store and another who is not employed. However, occupation can be a mediator, which makes including both age and occupation problematic.
+ 
+- Number of contact will also vary by region in case population density, urbanity, etc. differ across regions. 
+
+### Conceptual approach 
+
+- Three conceptual modelling approaches: descriptive, predictive and explanatory modelling according to [the study by Shmueli](https://www.stat.berkeley.edu/~aldous/157/Papers/shmueli.pdf). 
+
+- Our study is best described as a descriptive study. It mainly builds on the data modelling culture (algorithmic modeling culture). It does not directly aim at obtaining optimal predictive performance, but at capturing the data structure parsimoniously. 
+
+- For a descriptive model, interpretability, transportability and general usability are important criteria [](https://diagnprognres.biomedcentral.com/articles/10.1186/s41512-020-00074-3).
+
+- To obtain good descriptive models, the (interrelated) challenges of selection of variables for inclusion and choice of the functional forms for continuous variables must be tackled.
+
+We start with all the variables (age, sex, household size, region) that have been collected
+
+```{r}
+dat <- data.table::fread("outputs/contact_data_20240528.csv")
+dat$date <- as.Date(dat$date)
+dat$date_grp <- factor(dat$date_grp, levels=c("Weekdays", "WeekdaysVacation","Weekends","LunarNewYear"))
+
+dat$dayofweek <- factor(dat$dayofweek, 
+                        levels=c("Sunday","Monday","Tuesday","Wednesday",
+                                 "Thursday","Friday","Saturday"))
+age_grp_label <- c("0-4","5-9","10-14","15-19","20-29",
+                   "30-39","40-49","50-59","60-69","70-79")
+dat$age_grp <- factor(dat$age_grp, levels=age_grp_label)
+
+age_grp_broader_label <- c("0-4","5-9","10-19","20-29",
+                   "30-39","40-59","60-79")
+dat$age_grp_broader <- factor(dat$age_grp_broader, levels=age_grp_broader_label)
+dat$hhsize_grp <- factor(dat$hhsize_grp, 
+                         levels=c(as.character(paste0(1:4)),"5+"))
+dat$hhsize_grp <- relevel(dat$hhsize_grp, ref="1")
+dat$sex <- factor(dat$sex, levels=c("F","M"))
+kor_regions <- c("Seoul",
+                 "Busan","Daegu","Incheon","Gwangju","Daejeon","Ulsan",
+                 "Sejong",
+                 "Gyeonggi-do","Gangwon-do",
+                 "Chungcheongbuk-do","Chungcheongnam-do",
+                 "Jeollabuk-do","Jeollanam-do",
+                 "Gyeongsangbuk-do","Gyeongsangnam-do",
+                 "Jeju")
+dat$region <- factor(dat$region)
+
+# dat$date_grp <- relevel(dat$date_grp, ref="Weekdays")
+kor_regions_broader <- c("Seoul Metropolitan", "Chungcheong", "Gyeongsang",
+                         "Jeolla", "Gangwon", "Jeju")
+dat$region_broader <- factor(dat$region_broader, levels=kor_regions_broader)         
+dat$occupation <- factor(dat$occupation)
+dat$occupation <- relevel(dat$occupation, ref="Unemployed/retired")
+
+# introducing survey fatigue 
+unique(dat$date)
+# code days since survey 1 through 7
+dat$day_since_survey <- ifelse(dat$date < as.Date("2024-01-01"), 
+                               as.double(dat$date - as.Date("2023-12-05")),
+                               as.double(dat$date - as.Date("2024-02-06")))
+
+# dat_full <- dat
+# dat <- subset(dat_full, date < as.Date("2024-01-01")) # first survey
+```
+
+Some summary statistics to supplement summary tables for regression analyses
+```{r}
+dat |> 
+  dplyr::group_by(id) |>
+  dplyr::summarize(contacts_id = mean(contacts),
+                   age_grp = age_grp[1]) |> 
+  dplyr::group_by(age_grp) |>
+  dplyr::summarize(n = n(),
+                   mean_contacts = mean(contacts_id),
+                   sd_contacts = sd(contacts_id))  -> age_counts
+
+dat |> 
+  dplyr::group_by(id) |>
+  dplyr::summarize(contacts_id = mean(contacts),
+                   sex = sex[1]) |> 
+  dplyr::group_by(sex) |>
+  dplyr::summarize(n = n(),
+                   mean_contacts = mean(contacts_id),
+                   sd_contacts = sd(contacts_id))  -> sex_counts
+
+dat |> 
+  dplyr::group_by(date_grp) |>
+  dplyr::summarize(n = n(),
+                   mean_contacts = mean(contacts),
+                   sd_contacts = sd(contacts))  -> date_grp_counts
+
+dat |> 
+  dplyr::group_by(id) |>
+  dplyr::summarize(contacts_id = mean(contacts),
+                   hhsize_grp = hhsize_grp[1]) |> 
+  dplyr::group_by(hhsize_grp) |>
+  dplyr::summarize(n = n(),
+                   mean_contacts = mean(contacts_id),
+                   sd_contacts = sd(contacts_id))  -> household_counts
+```
+
+
+### POLYMOD-like table
+```{r}
+## Estimates
+fit <- readRDS("outputs/baye_dategrp_20240607.rds")
+xhat <- exp(fixef(fit)[,1])
+lb <- exp(fixef(fit)[,3])
+ub <- exp(fixef(fit)[,4])
+
+est_ <- sprintf("%.2f (%.2f - %.2f)", xhat, lb, ub)
+# include reference values
+est <- c(est_[1], "1.00", est_[2:10], "1.00", est_[11], "1.00", est_[12:14],
+"1.00",est_[15:18])
+
+
+numpart <- c(age_counts$n, sex_counts$n, date_grp_counts$n, 
+             household_counts$n)
+mean_contacts <- c(age_counts$mean_contacts, sex_counts$mean_contacts,
+                   date_grp_counts$mean_contacts, 
+                   household_counts$mean_contacts)
+sd_contacts <- c(age_counts$sd_contacts, sex_counts$sd_contacts,
+                 date_grp_counts$sd_contacts, household_counts$sd_contacts)
+crude_ratio <- c(mean_contacts[1:10]/mean_contacts[1],
+                 mean_contacts[11:12]/mean_contacts[11],
+                 mean_contacts[13:16]/mean_contacts[13],
+                 mean_contacts[17:21]/mean_contacts[17])
+contacts <- sprintf("%.2f (%.2f)", mean_contacts, sd_contacts)
+
+covars <- c("0-4", "5-9", "10-14", "15-19", "20-29","30-39", "40-49",
+               "50-59", "60-69", "70+",
+               "Female", "Male",
+               "Weekdays", "Vacation weekdays", "Weekends", "New Year Holidays",
+               "1", "2", "3", "4", "5+")
+
+df <- data.frame(category=c(rep("Age",10), 
+                          rep("Sex",2),
+                          rep("Date group",4), rep("HH size",5)),
+                 covariate = covars, 
+                 num = numpart,
+                 marginals = contacts,
+                 crude_ratio = crude_ratio,
+                 estimates = est[2:22]) # exclude intercept
+
+names(df) <- c("Category","Covar", "No. part", 
+               "Marginal mean (sd)","Crude ratio",
+               "Estimate (95% CrI)")
+
+knitr::kable(df)
+# random effect
+rand_eff <- sprintf("%.2f (%.2f - %.2f)", 0.48, 0.46, 0.50)
+phi <- sprintf("Dispersion parameter, phi = %.2f (%.2f - %.2f)", 14.03, 13.19, 14.94)
+
+# sprintf("Dispersion parameter, phi = %.2f (%.2f - %.2f)", est, lb, ub)
+# sprintf("alpha = %.2f (%.2f - %.2f)", 1/est, 1/ub, 1/lb)
+```
+
+$$
+\text{NegBinomial}2(y|\mu,\phi)=\left(\begin{array}
+ + y + \phi - 1 \\ 
+ y 
+ \end{array} \right) \left(\frac{\mu}{\mu+\phi} \right)^y \left(\frac{\phi}{\mu+\phi} \right)^\phi
+$$
+
+$$
+y_i \sim \text{NB}(y_i|\mu_i,\phi)=\frac{\Gamma (y_i + \theta)}{\Gamma (\theta) y_i !}) \left(\frac{\mu_i}{\mu_i+\phi} \right)^y \left(\frac{\phi}{\mu_i+\phi} \right)^\phi
+$$
+
+$\mu_i$ and $\phi$ are the mean and the dispersion (or shape) parameter, respectively, and $\Gamma (\cdot)$ is the gamma function. 
+
+$$\bf{E}[Y]= \mu \text{ and }\bf{Var}[Y] = \mu + \frac{\mu^2}{\phi}
+$$
+
+## Prior predictive check
+
+Approach 1. use the generated quantities in the stan code
+[Betancourt's blog post]() -- I am not yet familiar with the stan code and
+therefore follow the `brms` and `marginaleffects` approach.
+```{r}
+mod <- brms::brm(contacts|weights(wt) ~ age_grp + date_grp + hhsize_grp,
+                 data = dat, family = negbinomial())
+stancode(mod)
+make_stancode(contacts|weights(wt) ~ age_grp + date_grp + hhsize_grp + (1|id),
+                 data = dat, family = negbinomial())
+
+# d <- dat[, c("contacts", "wt", "age_grp", "date_grp", "hhsize_grp", "id")]
+library(rstan)
+rstan_options(auto_write = TRUE)
+dat <- as.data.frame(dat)
+N <- nrow(dat)
+R <- 1000
+d <- list(N=N,
+          contacts = dat[,"contacts"],
+          weights = dat[,"wt"],
+          age_grp = dat[,"age_grp"],
+          date_grp = dat[,"date_grp"],
+          hhsize_grp = dat[,"hhsize_grp"],
+          id =dat[,"id"])
+
+d <- list(N=N, 
+          Y = as.integer(dat[,"contacts"]),
+          weights = as.numeric(dat[,"wt"]),
+          K = 3, 
+          XN_1 = N,  
+          M_1 = 1)
+
+
+mod <- stan_model(file='negbin_mixed_ppcheck.stan', verbose=TRUE)
+
+fit <- stan(file='negbin_mixed_ppcheck.stan', data=d,
+            iter=R, warmup=0, chains=1, refresh=R,
+            seed=4838282, algorithm="Fixed_param")
+
+fit <- stan(file='negbin_mixed.stan', data=d,
+            iter=R, warmup=0, chains=1, refresh=R,
+            seed=4838282)
+```
+
+
+
+Using `brms` and `marginaleffects` packages
+
+```{r}
+library(brms)
+library(marginaleffects)
+prior_pred <- 
+  brms::brm(contacts|weights(wt) ~ age_grp + date_grp + hhsize_grp,
+            data = dat, 
+            family = negbinomial(),
+            prior = c(set_prior("normal(0,5)", class = "Intercept"),
+                      set_prior("normal(0,2)", class = "b")),
+            sample_prior = "only", cores = 4)
+
+post_pred <- 
+  brms::brm(contacts|weights(wt) ~ age_grp + date_grp + hhsize_grp,
+            data = dat, 
+            family = negbinomial(),
+            prior = c(set_prior("normal(0,5)", class = "Intercept"),
+                      set_prior("normal(0,2)", class = "b")),
+            cores = 4)
+saveRDS(prior_pred, "outputs/prior_pred_20240719.rds")
+saveRDS(post_pred, "outputs/post_pred_20240719.rds")
+```
+
+```{r}
+prior_pred <- readRDS("outputs/prior_pred_20240719.rds")
+post_pred <- readRDS("outputs/post_pred_20240719.rds")
+
+pp_check(prior_pred, type="bars", ndraws = 200)
+
+
+```
+Use `marginaleffects` 
+```{r}
+library(marginaleffects)
+cmp <- list(
+    "Prior" = avg_comparisons(prior_pred),
+    "Posterior" = avg_comparisons(post_pred))
+
+modelsummary(
+    cmp,
+    output = "markdown",
+    statistic = "conf.int",
+    fmt = fmt_significant(2),
+    gof_map = NA,
+    shape = term : contrast ~ model)
+```
+
+Get prior distribution
+```{r}
+brms::get_prior(contacts|weights(wt) ~ age_grp + date_grp + hhsize_grp + (1|id), 
+                data = dat,
+                family = negbinomial())
+
+prior_pred <- brms::brm(contacts|weights(wt) ~ age_grp + date_grp + hhsize_grp + (1|id), 
+                 data = dat, 
+                 family = negbinomial(),
+                 prior = c(set_prior("normal(0,5)", class = "Intercept"),
+                      set_prior("normal(0,2)", class = "b"),
+                      set_prior("normal(0,2)", class = "sd")),
+                 sample_prior = "only",
+                 iter = 4000, warmup = 2000, cores = 4)
+```
+
+
+```{r, eval=F}
+library(brms)
+fit <- brms::brm(contacts|weights(wt) ~ age_grp + date_grp + hhsize_grp + day_since_survey + (1|id), data = dat, family = poisson(),
+            prior = c(set_prior("normal(0,5)", class = "Intercept"),
+                      set_prior("normal(0,2)", class = "b"),
+                      set_prior("normal(0,2)", class = "sd")),
+            sample_prior = TRUE,
+            iter = 4000, warmup = 2000, cores = 4)
+
+fit
+saveRDS(fit, paste0("outputs/baye_pois_mix_dategrp_fatigue_", tstamp(), ".rds"))
+```
+
+
+
+Simulate prior predictive values
+
+### Bayesian GLMM using the `brms` package 
+
+
+
+```{r, eval=F}
+library(brms)
+fit <- brms::brm(contacts|weights(wt) ~ age_grp + date_grp + hhsize_grp + day_since_survey + (1|id), data = dat, family = poisson(),
+            prior = c(set_prior("normal(0,5)", class = "Intercept"),
+                      set_prior("normal(0,2)", class = "b"),
+                      set_prior("normal(0,2)", class = "sd")),
+            sample_prior = TRUE,
+            iter = 4000, warmup = 2000, cores = 4)
+
+fit
+saveRDS(fit, paste0("outputs/baye_pois_mix_dategrp_fatigue_", tstamp(), ".rds"))
+```
+
+Explore models in a step-wise fashion
+```{r, eval=F}
+library(brms)
+fit1 <- brms::brm(contacts|weights(wt) ~ 1, data = dat, family = poisson(),
+            prior = c(set_prior("normal(0,5)", class = "Intercept")),
+            sample_prior = TRUE,
+            iter = 4000, warmup = 2000, cores = 2)
+
+fit1
+pp_check(fit1, type="bars", ndraws = 200)
+
+fit2 <- brms::brm(contacts|weights(wt) ~ 1 + age_grp, data = dat, family = poisson(),
+            prior = c(set_prior("normal(0,5)", class = "Intercept"),
+                      set_prior("normal(0,2)", class = "b")),
+            sample_prior = TRUE,
+            iter = 4000, warmup = 2000, chains = 2, cores = 2)
+
+fit2
+pp_check(fit2, type="bars", ndraws = 200)
+
+
+fit3 <- brms::brm(contacts|weights(wt) ~ 1 + age_grp + date_grp, data = dat, family = poisson(),
+            prior = c(set_prior("normal(0,5)", class = "Intercept"),
+                      set_prior("normal(0,2)", class = "b")),
+            sample_prior = TRUE,
+            iter = 4000, warmup = 2000, chains = 2, cores = 2)
+
+fit3
+pp_check(fit3, type="bars", ndraws = 200)
+
+
+fit4 <- brms::brm(contacts|weights(wt) ~ 1 + age_grp + date_grp +
+                    hhsize_grp, data = dat, family = poisson(),
+            prior = c(set_prior("normal(0,5)", class = "Intercept"),
+                      set_prior("normal(0,2)", class = "b")),
+            sample_prior = TRUE,
+            iter = 4000, warmup = 2000, chains = 2, cores = 2)
+
+fit4
+pp_check(fit4, type="bars", ndraws = 200)
+
+
+fit5 <- brms::brm(contacts|weights(wt) ~ 1 + age_grp + date_grp +
+                    hhsize_grp + day_since_survey, 
+                  data = dat, family = poisson(),
+            prior = c(set_prior("normal(0,5)", class = "Intercept"),
+                      set_prior("normal(0,2)", class = "b")),
+            sample_prior = TRUE,
+            iter = 4000, warmup = 2000, chains = 2, cores = 2)
+
+fit5
+pp_check(fit5, type="bars", ndraws = 200)
+
+fit6 <- brms::brm(contacts|weights(wt) ~ 1 + age_grp + date_grp +
+                    hhsize_grp + day_since_survey + (1|id), 
+                  data = dat, family = poisson(),
+            prior = c(set_prior("normal(0,5)", class = "Intercept"),
+                      set_prior("normal(0,2)", class = "b"),
+                      set_prior("normal(0,2)", class = "sd")),
+            sample_prior = TRUE,
+            iter = 4000, warmup = 2000, chains = 2, cores = 2)
+
+fit6
+pp_check(fit6, type="bars", ndraws = 200)
+
+fit7 <- brms::brm(contacts|weights(wt) ~ 1 + age_grp + date_grp +
+                  hhsize_grp + day_since_survey + (1|id) + (1|age_grp), 
+                  data = dat, family = poisson(),
+            prior = c(set_prior("normal(0,5)", class = "Intercept"),
+                      set_prior("normal(0,2)", class = "b"),
+                      set_prior("normal(0,2)", class = "sd")),
+            sample_prior = TRUE,
+            iter = 4000, warmup = 2000, chains = 2, cores = 2)
+
+fit7
+pp_check(fit7, type="bars", ndraws = 200)
+
+# remove weight
+# would that improve the fit of posterior predictive samples to data
+fit8 <- brms::brm(contacts ~ 1 + age_grp + date_grp +
+                    hhsize_grp + day_since_survey + (1|id), 
+                  data = dat, family = poisson(),
+            prior = c(set_prior("normal(0,5)", class = "Intercept"),
+                      set_prior("normal(0,2)", class = "b"),
+                      set_prior("normal(0,2)", class = "sd")),
+            sample_prior = TRUE,
+            iter = 4000, warmup = 2000, cores = 2)
+
+fit6
+pp_check(fit6, type="bars", ndraws = 200)
+```
+
+Model checks
+```{r}
+fit <- readRDS("outputs/baye_dategrp_20240607.rds")
+# posterior predictive check
+pp_check(fit, type="bars", ndraws = 200)
+
+# check mean
+mean(dat$contacts)
+pps <- posterior_predict(fit, ndraws = 200)
+quantile(rowMeans(pps), probs=c(0.025, 0.5, 0.975))
+
+# check variance
+var(dat$contacts)
+quantile(apply(pps, 1, var), probs=c(0.025, 0.5, 0.975))
+# overdispersion check
+dispersion <- function(x) var(x)/mean(x)
+var(dat$contacts)/mean(dat$contacts)
+quantile(apply(pps, 1, dispersion), probs=c(0.025, 0.5, 0.975))
+```
+
+### Custom prior
+```{r}
+#
+library(brms)
+tic <- Sys.time()
+set_prior("normal(0, 10)", class = "Intercept")
+set_prior("normal(0, 2)", class = "b")
+m0 <- brms::brm(contacts|weights(wt) ~ age_grp + sex + dayofweek + hhsize_grp + (1|id), data = dat, family = poisson(), 
+                iter = 10000, 
+                warmup = 5000, 
+                cores = 4)
+saveRDS(m0, paste0("outputs/baye_pois_dayofweek_", tstamp(), ".rds"))
+Sys.time() - tic
+```
+
+Date group
+```{r}
+#
+library(brms)
+tic <- Sys.time()
+set_prior("normal(0, 10)", class = "Intercept")
+set_prior("normal(0, 2)", class = "b")
+m0 <- brms::brm(contacts|weights(wt) ~ age_grp + sex + date_grp + hhsize_grp + (1|id), data = dat_full, family = negbinomial(), iter = 20000, warmup = 5000, cores = 4)
+saveRDS(m0, paste0("outputs/baye_dategrp_", tstamp(), ".rds"))
+Sys.time() - tic
+
+
+library(brms)
+tic <- Sys.time()
+set_prior("normal(0, 10)", class = "Intercept")
+set_prior("normal(0, 2)", class = "b")
+m0 <- brms::brm(contacts|weights(wt) ~ age_grp + sex + date_grp + hhsize_grp + (1|id), data = dat_full, family = poisson(), iter = 20000, warmup = 5000, cores = 4)
+saveRDS(m0, paste0("outputs/baye_dategrp_pois_", tstamp(), ".rds"))
+Sys.time() - tic
+```
+
+```{r}
+summary(m0)
+ranef(m0)
+pp_check(m0)
+pp_check(m0, type = "error_hist", ndraws = 11)
+pp_check(m0, type = "scatter_avg", ndraws = 100)
+pp_check(m0, type = "stat_2d")
+pp_check(m0, type = "rootogram")
+pp_check(m0, type = "loo_pit")
+```
+
+### Fake-data simulation
+```{r}
+library(extraDistr)
+N <- 1000
+id <- 1:N
+nrepeat <- 7
+pop_intercept <- 1.3
+# "0-4" "5-9" "10-14" "15-19" "20-29" "30-39" "40-49" "50-59" "60-69" "70-79"
+age_grp <- sample(1:5, size=N, replace=TRUE) # with equal probability 
+# c("Weekdays", "WeekdaysVacation", "Weekends", "LunarNewYear")
+date_grp <- sample(1:4, size=N, replace=TRUE)
+# c(as.character(1:4),"5+")
+hhsize_grp <- sample(1:5, size=N, replace=TRUE, 
+                     prob=c(0.2,0.25,0.25,0.25,0.05))
+
+log_rr_age <- c(0, 0.41, 0.6, -0.42, -0.01)
+log_rr_dategrp <- c(0, -0.41, -0.26, -0.15)
+log_rr_hhsizegrp <- c(0, 0.21, 0.36, 0.45, 0.64)
+
+random_error <- rnorm(N, mean=0, sd=0.02)
+
+log_mean_contacts <- pop_intercept + log_rr_age[age_grp] + 
+  log_rr_dategrp[date_grp] + log_rr_hhsizegrp[hhsize_grp] +
+   + random_error
+
+contacts <- rtpois(N, lambda=exp(log_mean_contacts), a=0, b=60)
+wt <- rnorm(N, 1, 0.2)
+
+d <- data.frame(id = as.character(id),
+                contacts = contacts, 
+                age_grp = as.factor(age_grp), 
+                hhsize_grp = as.factor(hhsize_grp),
+                date_grp = as.factor(date_grp),
+                wt = wt)
+```
+
+
+```{r}
+library(brms)
+tic <- Sys.time()
+set_prior("normal(0, 10)", class = "Intercept")
+set_prior("normal(0, 2)", class = "b")
+
+fit_pois <- brms::brm(contacts|weights(wt) ~ age_grp + date_grp + 
+                  hhsize_grp, data = d, 
+                family = poisson(), iter=2000, cores = 4)
+Sys.time() - tic
+summary(fit_pois)
+```
+
+Random intercept but GLM
+```{r}
+rand_intercept <- rnorm(N, mean=0, sd=0.3)
+
+log_mean_contacts <- pop_intercept + log_rr_age[age_grp] + 
+  log_rr_dategrp[date_grp] + log_rr_hhsizegrp[hhsize_grp] +
+   + random_error + rand_intercept
+
+contacts <- rtpois(N, lambda=exp(log_mean_contacts), a=0, b=60)
+wt <- rnorm(N, 1, 0.2)
+
+d <- data.frame(id = as.character(id),
+                contacts = contacts, 
+                age_grp = as.factor(age_grp), 
+                hhsize_grp = as.factor(hhsize_grp),
+                date_grp = as.factor(date_grp),
+                wt = wt)
+
+library(brms)
+tic <- Sys.time()
+set_prior("normal(0, 10)", class = "Intercept")
+set_prior("normal(0, 2)", class = "b")
+
+fit_pois <- brms::brm(contacts|weights(wt) ~ age_grp + date_grp + 
+                  hhsize_grp, data = d, 
+                family = poisson(), iter=2000, cores = 4)
+Sys.time() - tic
+summary(fit_pois)
+```
+
+
+Random intercept, repeated measure but GLM
+```{r}
+nrepeat <- 7
+rand_intercept <- rnorm(N, mean=0, sd=0.3)
+
+log_mean_contacts <- pop_intercept + log_rr_age[age_grp] + 
+  log_rr_dategrp[date_grp] + log_rr_hhsizegrp[hhsize_grp] +
+   + random_error + rand_intercept
+
+contacts <- as.vector(replicate(nrepeat, 
+                      rtpois(N, lambda=exp(log_mean_contacts), a=0, b=60)))
+wt <- rnorm(N, 1, 0.2)
+
+d <- data.frame(id = rep(as.character(id), nrepeat),
+                contacts = contacts, 
+                age_grp = rep(as.factor(age_grp), nrepeat), 
+                hhsize_grp = rep(as.factor(hhsize_grp), nrepeat),
+                date_grp = rep(as.factor(date_grp), nrepeat),
+                wt = rep(wt,nrepeat))
+
+library(brms)
+tic <- Sys.time()
+set_prior("normal(0, 10)", class = "Intercept")
+set_prior("normal(0, 2)", class = "b")
+
+fit_pois <- brms::brm(contacts|weights(wt) ~ age_grp + date_grp + 
+                  hhsize_grp, data = d, 
+                family = poisson(), iter=2000, cores = 4)
+Sys.time() - tic
+summary(fit_pois)
+```
+
+NegBin
+```{r}
+tic <- Sys.time()
+set_prior("normal(0, 10)", class = "Intercept")
+set_prior("normal(0, 2)", class = "b")
+
+fit_nb <- brms::brm(contacts|weights(wt) ~ age_grp + date_grp + 
+                  hhsize_grp, data = d, 
+                family = negbinomial(), iter=2000, cores = 4)
+Sys.time() - tic
+summary(fit_nb)
+```
+
+Random intercept, repeated measure, mixed model
+```{r}
+tic <- Sys.time()
+set_prior("normal(0, 10)", class = "Intercept")
+set_prior("normal(0, 2)", class = "b")
+
+fit_pois_mix <- brms::brm(contacts|weights(wt) ~ age_grp + date_grp + 
+                  hhsize_grp + (1|id), data = d, 
+                family = poisson(), iter=2000, cores = 4)
+Sys.time() - tic
+summary(fit_pois_mix)
+```
+
+Random intercept, repeated measure, mixed model
+```{r}
+tic <- Sys.time()
+set_prior("normal(0, 10)", class = "Intercept")
+set_prior("normal(0, 2)", class = "b")
+
+fit_nb_mix <- brms::brm(contacts|weights(wt) ~ age_grp + date_grp + 
+                  hhsize_grp + (1|id), data = d, 
+                family = negbinomial(), iter=2000, cores = 4)
+Sys.time() - tic
+summary(fit_nb_mix)
+plot(fit_nb_mix, variable = c("b_age_grp2"))
+plot(conditional_effects(fit_nb_mix, effects = "age_grp:hhsize_grp"))
+fixef(fit_nb_mix)
+coef(fit_nb_mix)
+pp_check(fit_nb_mix, ndraws=1e3)
+loo(fit_pois_mix, fit_nb_mix, compare = TRUE)
+loo_pois_mix <- loo(fit_pois_mix)
+loo_nb_mix <- loo(fit_nb_mix)
+loo_compare(loo_poix_mix, loo_nb_mix)
+```
+
+```{r}
+contacts <- as.vector(
+  replicate(nrepeat, rtpois(N, 
+                            lambda=exp(log_mean_contacts),
+                            a = 0, b = 60)))
+wt <- rnorm(N, 1, 0.2)
+
+d <- data.frame(id = as.character(as.vector(replicate(nrepeat, 1:N))),
+                contacts = contacts, 
+                age_grp = as.factor(rep(age_grp, nrepeat)), 
+                hhsize_grp = as.factor(rep(hhsize_grp, nrepeat)),
+                date_grp = as.factor(rep(date_grp, nrepeat)),
+                wt = rep(wt, nrepeat))
+
+head(d$contacts)
+hist(d$contacts, breaks=30)
+summary(d$contacts)
+
+
+library(brms)
+tic <- Sys.time()
+set_prior("normal(0, 10)", class = "Intercept")
+set_prior("normal(0, 2)", class = "b")
+
+fit_pois <- brms::brm(contacts|weights(wt) ~ age_grp + date_grp + 
+                  hhsize_grp + (1|id), data = d, 
+                family = poisson(), iter = 1000, warmup = 500, cores = 4)
+Sys.time() - tic
+
+tic <- Sys.time()
+fit_negbin <- brms::brm(contacts|weights(wt) ~ age_grp + date_grp + 
+                  hhsize_grp + (1|id), data = d, 
+                family = negbinomial(), iter = 1000, warmup = 500, cores = 4)
+Sys.time() - tic
+```
+
+
+
+Analysis of variance
+```{r}
+oneway_age <- aov(contacts ~ age_grp, data = dat[dat$date == as.Date("2023-12-06"),])
+summary(oneway_age)
+oneway_region <- aov(contacts ~ region, data = dat[dat$date == as.Date("2023-12-06"),])
+summary(oneway_region)
+oneway_hhsize <- aov(contacts ~ hhsize_grp, data = dat[dat$date == as.Date("2023-12-06"),])
+summary(oneway_hhsize)
+oneway_occupation <- aov(contacts ~ occupation, data = dat[dat$date == as.Date("2023-12-06"),])
+summary(oneway_occupation)
+
+age <- aov(contacts ~ age_grp, data = dat[dat$date == as.Date("2023-12-06"),])
+summary(age)
+ar <- aov(contacts ~ age + hhsize_grp, data = dat[dat$date == as.Date("2023-12-06"),])
+summary(ar)
+arh <- aov(contacts ~ age + hhsize_grp + region, data = dat[dat$date == as.Date("2023-12-06"),])
+summary(arh)
+arho <- aov(contacts ~ age + hhsize_grp + region + occupation, data = dat[dat$date == as.Date("2023-12-06"),])
+summary(arho)
+```
+
+
+```{r}
+d <- dat[,c("id","dayofweek", "contacts")]
+dwide <- pivot_wider(d, names_from = dayofweek, values_from = contacts)
+cov_obs <- select(dwide, ends_with("day")) %>% 
+  cov()
+cov_obs
+cov2cor(cov_obs)
+```
+
+```{r}
+library(GGally)
+ggpairs(select(dwide, ends_with("day")), lower = list(continuous = "smooth"))
+```
+
+
+
+
+
+
+### Negative binomial vs. poisson
+
+Negative binomial regression performs better in the likelihood ratio test and Akaike Information Criteria (AIC). Estimates are similar but
+the standard errors will be biased for the poisson model
+
+```{r}
+fm1 <- contacts ~ age_grp + sex + dayofweek + hhsize_grp + region
+m1_pois <- glm(fm1, data = dat, weights = wt, family="poisson")
+m1_negbin <- glm.nb(fm1, data = dat, weights = wt)
+
+knitr::kable(exp(m1_negbin$coefficients))
+AIC(m1_pois, m1_negbin)
+anova(m1_pois, m1_negbin)
+rms::vif(m1_negbin)
+```
+
+### Negative binomial regression with varying covariates
+
+```{r, eval=F, echo=F}
+library(MASS)
+fm_list <- list()
+
+fm_list[[1]] <- contacts ~ age_grp + sex + dayofweek + hhsize_grp + region + occupation
+fm_list[[2]] <- contacts ~ age_grp + sex + dayofweek + hhsize_grp + region
+fm_list[[3]] <- contacts ~ age_grp + sex + dayofweek + hhsize_grp
+fm_list[[4]] <- contacts ~ age_grp + sex + dayofweek
+fm_list[[5]] <- contacts ~ age_grp + sex
+fm_list[[6]] <- contacts ~ age_grp
+
+glm_res <- lapply(fm_list, function(x) glm.nb(x, data = dat, weights = wt))
+# saveRDS(glm_res, paste0("outputs/glm_res_", tstamp(), ".rds"))
+```
+
+
+Summary table 1
+```{r}
+glm_res <- readRDS("C:outputs/glm_res_20240521.rds")
+df <- data.frame(
+  Model = c("age_grp + sex + dayofweek + hhsize_grp + region + occupation", 
+  "age_grp + sex + dayofweek + hhsize_grp + region", 
+  "age_grp + sex + dayofweek + hhsize_grp", 
+  "age_grp + sex + dayofweek", 
+  "age_grp + sex", 
+  "age_grp"), 
+AIC = sapply(glm_res, function(x) AIC(x)))
+knitr::kable(df)
+anova(glm_res[[1]], glm_res[[2]])
+rms::vif(glm_res[[1]])
+knitr::kable(exp(glm_res[[2]]$coefficients))
+```
+
+POLYMOD-like table
+```{r}
+## Estimates
+m <- glm_res[[2]]
+xhat <- exp(summary(m)$coefficients[,1])
+lb <- exp(summary(m)$coefficients[,1]) - 
+  qnorm(0.975) * summary(m)$coefficients[,2] 
+ub <- exp(summary(m)$coefficients[,1]) + 
+  qnorm(0.975) * summary(m)$coefficients[,2]
+
+est_ <- sprintf("%.2f (%.2f - %.2f)", xhat, lb, ub)
+# include reference values
+est <- c(est_[1], "1.00", est_[2:10], "1.00", est_[11], "1.00", est_[12:17],
+"1.00",est_[18:21], "1.00", est_[22:37])
+
+
+numpart <- c(age_counts$n, sex_counts$n, dayofweek_counts$n, 
+             household_counts$n, region_counts$n)
+mean_contacts <- c(age_counts$mean_contacts, sex_counts$mean_contacts,
+                   dayofweek_counts$mean_contacts, 
+                   household_counts$mean_contacts,
+                   region_counts$mean_contacts)
+sd_contacts <- c(age_counts$sd_contacts, sex_counts$sd_contacts,
+                 dayofweek_counts$sd_contacts, household_counts$sd_contacts, 
+                 region_counts$sd_contacts)
+
+contacts <- sprintf("%.2f (%.2f)", mean_contacts, sd_contacts)
+
+covars <- c("0-4", "5-9", "10-14", "15-19", "20-29","30-39", "40-49",
+               "50-59", "60-69", "70+",
+               "Female", "Male",
+               "Sun","Mon","Tue","Wed","Thu","Fri",
+               "Sat", 
+               "1", "2", "3", "4", "5+",
+            "Seoul",
+                 "Busan","Daegu","Incheon","Gwangju","Daejeon","Ulsan",
+                 "Sejong",
+                 "Gyeonggi","Gangwon",
+                 "Chungbuk","Chungnam",
+                 "Jeonbuk","Jeonnam",
+                 "Gyeongbuk","Gyeongnam",
+                 "Jeju")
+
+df <- data.frame(category=c(rep("Age",10), 
+                          rep("Sex",2),
+                          rep("Day",7), rep("HH size",5),
+                          rep("Region",17)),
+                 covariate = covars, 
+                 num = numpart,
+                 marginals = contacts,
+                 estimates = est[2:42]) # exclude intercept
+
+names(df) <- c("Category","Covar", "No. part", 
+               "Marginal mean (sd)",
+               "Est")
+
+knitr::kable(df)
+m$theta
+m$SE.theta
+est <- m$theta
+lb <- m$theta - qnorm(0.975)*m$SE.theta 
+ub <- m$theta + qnorm(0.975)*m$SE.theta 
+sprintf("Dispersion parameter, theta = %.2f (%.2f - %.2f)", est, lb, ub)
+sprintf("alpha = %.2f (%.2f - %.2f)", 1/est, 1/ub, 1/lb)
+```
+
+### `dayofweek` analysis
+
+```{r, eval=F}
+dat <- subset(dat_full, date > as.Date("2024-01-01"))
+
+wk <- c("Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday")
+glm_by_dayofweek <- vector("list", length(wk))
+
+for (i in 1:length(wk)) {
+  dat_day <- subset(dat, dayofweek == wk[i])
+  glm_by_dayofweek[[i]] <- 
+    MASS::glm.nb(contacts ~ age_grp + sex + hhsize_grp + region,
+                             data = dat_day, weights = wt)
+}
+
+saveRDS(glm_by_dayofweek,  paste0("outputs/glm_dayofweek_2024_", tstamp(), ".rds"))
+
+```
+
+### Generalized linear model(GLM)
+
+```{r, eval=FALSE}
+tic <- Sys.time()
+library(MASS)
+m <- glm(contacts ~ age_grp + sex + dayofweek + hhsize_grp, 
+           weights=wt, data=dat, 
+           family=poisson(link = "log"))
+Sys.time() - tic
+saveRDS(m,
+        paste0("outputs/glmm_pois_id_", tstamp(), ".rds"))
+
+
+library(MASS)
+m <- glmer(contacts ~ age_grp + sex + date_grp + hhsize_grp + (1|id), 
+           weights=wt, data=dat_full, 
+           family=poisson(link = "log"),
+           control=glmerControl(calc.derivs = FALSE,
+                                   optimizer="bobyqa",
+                                   optCtrl = list(maxfun = 2e5)))
+saveRDS(m,
+        paste0("outputs/glmm_pois_dategrp_id_", tstamp(), ".rds"))
+```
+
+### Generalized linear mixed model(GLMM)
+
+`id` random effect
+
+```{r, eval=FALSE}
+tic <- Sys.time()
+library(MASS)
+m <- glmer(contacts ~ age_grp + sex + dayofweek + hhsize_grp + (1|id), 
+           weights=wt, data=dat, 
+           family=poisson(link = "log"),
+           control=glmerControl(calc.derivs = FALSE,
+                                   optimizer="bobyqa",
+                                   optCtrl = list(maxfun = 2e5)))
+Sys.time() - tic
+saveRDS(m,
+        paste0("outputs/glmm_pois_id_", tstamp(), ".rds"))
+
+
+library(MASS)
+m <- glmer(contacts ~ age_grp + sex + date_grp + hhsize_grp + (1|id), 
+           weights=wt, data=dat_full, 
+           family=poisson(link = "log"),
+           control=glmerControl(calc.derivs = FALSE,
+                                   optimizer="bobyqa",
+                                   optCtrl = list(maxfun = 2e5)))
+saveRDS(m,
+        paste0("outputs/glmm_pois_dategrp_id_", tstamp(), ".rds"))
+```
+
+`dayofweek` random effect
+
+```{r, eval=FALSE}
+library(MASS)
+tic <- Sys.time()
+m <- glmer(contacts ~ age_grp + sex + dayofweek + hhsize_grp, weights=wt, 
+              data=dat,
+              control=glmerControl(calc.derivs = FALSE,
+                                   optimizer="bobyqa",
+                                   optCtrl = list(maxfun = 2e5)))
+
+# m <- glmer.nb(contacts ~ age_grp + sex + dayofweek + hhsize_grp +
+#                 region + (1|dayofweek), weights=wt, data=dat,
+#               control=glmerControl(calc.derivs = FALSE,
+#                                    optimizer="bobyqa"))
+
+
+
+m <- glmer.nb(contacts ~ age_grp + sex + hhsize_grp +
+                region + (1|dayofweek), weights=wt, data=dat, 
+              control=glmerControl(calc.derivs = FALSE,
+                                   optimizer="bobyqa"))
+Sys.time() - tic
+saveRDS(m,
+        paste0("outputs/glmm_dayofweek_fixed_missing_", tstamp(), ".rds"))
+```
+
+
+Estimates
+```{r}
+glm_res <- readRDS("outputs/glm_res_20240521.rds") # take the second, 2, standard model
+glmm_id <- readRDS("outputs/glmm_id_20240522.rds")
+# glmm_dayofweek <- readRDS("outputs/glmm_dayofweek_20240522.rds")
+
+summary_est <- function(m) {
+  xhat <- exp(summary(m)$coefficients[,1])
+  lb <- exp(summary(m)$coefficients[,1]) - 
+    qnorm(0.975) * summary(m)$coefficients[,2] 
+  ub <- exp(summary(m)$coefficients[,1]) + 
+    qnorm(0.975) * summary(m)$coefficients[,2]
+    est_ <- sprintf("%.2f (%.2f - %.2f)", xhat, lb, ub)
+  # include reference values
+  est <- c(est_[1], "1.00", est_[2:10], "1.00", est_[11], "1.00", est_[12:17],
+"1.00",est_[18:21], "1.00", est_[22:37])
+  return(est)
+}
+
+est_glm <- summary_est(glm_res[[2]])
+est_glmm_id <- summary_est(glmm_id)
+
+numpart <- c(age_counts$n, sex_counts$n, dayofweek_counts$n, 
+             household_counts$n, region_counts$n)
+mean_contacts <- c(age_counts$mean_contacts, sex_counts$mean_contacts,
+                   dayofweek_counts$mean_contacts, 
+                   household_counts$mean_contacts,
+                   region_counts$mean_contacts)
+sd_contacts <- c(age_counts$sd_contacts, sex_counts$sd_contacts,
+                 dayofweek_counts$sd_contacts, household_counts$sd_contacts, 
+                 region_counts$sd_contacts)
+
+contacts <- sprintf("%.2f (%.2f)", mean_contacts, sd_contacts)
+
+covars <- c("0-4", "5-9", "10-14", "15-19", "20-29","30-39", "40-49",
+               "50-59", "60-69", "70+",
+               "Female", "Male",
+               "Sun","Mon","Tue","Wed","Thu","Fri",
+               "Sat", 
+               "1", "2", "3", "4", "5+",
+            "Seoul",
+                 "Busan","Daegu","Incheon","Gwangju","Daejeon","Ulsan",
+                 "Sejong",
+                 "Gyeonggi","Gangwon",
+                 "Chungbuk","Chungnam",
+                 "Jeonbuk","Jeonnam",
+                 "Gyeongbuk","Gyeongnam",
+                 "Jeju")
+
+df <- data.frame(category=c(rep("Age",10), 
+                          rep("Sex",2),
+                          rep("Day",7), rep("HH size",5),
+                          rep("Region",17)),
+                 covariate = covars, 
+                 num = numpart,
+                 marginals = contacts,
+                 estimates = est_glm[2:42],
+                 est_glmm_id = est_glmm_id[2:42]) # exclude intercept
+
+names(df) <- c("Category","Covar", "No. part", 
+               "Marginal mean (sd)",
+               "Est", "Est_GLMM_id")
+
+knitr::kable(df)
+```
+
+
+
