@@ -253,13 +253,18 @@ Using `brms` and `marginaleffects` packages
 ```{r}
 library(brms)
 library(marginaleffects)
+
 prior_pred <- 
   brms::brm(contacts|weights(wt) ~ age_grp + date_grp + hhsize_grp,
             data = dat, 
             family = negbinomial(),
-            prior = c(set_prior("normal(0,5)", class = "Intercept"),
-                      set_prior("normal(0,2)", class = "b")),
-            sample_prior = "only", cores = 4)
+            prior = c(set_prior("normal(0,3)", class = "Intercept"),
+                      set_prior("normal(0,1)", class = "b")),
+            sample_prior = "only", cores = 4, nsamples=100)
+
+pp_check(prior_pred, type="bars", ndraws = 100)
+
+
 
 post_pred <- 
   brms::brm(contacts|weights(wt) ~ age_grp + date_grp + hhsize_grp,
